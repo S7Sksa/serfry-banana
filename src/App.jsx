@@ -1,4 +1,6 @@
 import React, { useState, useReducer, useContext, createContext, useEffect, useRef, useCallback, useMemo } from 'react';
+import JSZip from 'jszip';
+import FileSaver from 'file-saver';
 
 // ==========================================
 // 1. GLOBAL STYLES & THEME INJECTION
@@ -80,7 +82,7 @@ const GlobalStyles = () => (
     .btn-ghost { background: transparent; border: 1px solid rgba(255, 255, 255, 0.2); }
     .btn-ghost:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); background: rgba(255, 214, 0, 0.1); }
     .btn-danger { background: linear-gradient(135deg, var(--danger) 0%, #D32F2F 100%); color: #fff; border: none; }
-    .btn-icon { width: 40px; height: 40px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: var(--radius); }
+    .btn-icon { width: 36px; height: 36px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: var(--radius); }
 
     .scrollbar::-webkit-scrollbar { width: 10px; height: 10px; }
     .scrollbar::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); border-radius: 10px; }
@@ -125,8 +127,11 @@ const GlobalStyles = () => (
     .bulk-rename-panel { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-radius: var(--radius); padding: 16px; margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
     .bulk-rename-panel input { flex: 1; min-width: 200px; }
     .bulk-rename-panel button { width: auto; padding: 10px 16px; font-size: 0.9rem; }
+    .preview-box { font-size: 0.8rem; color: var(--text-muted); margin-top: 8px; font-family: var(--font-mono); line-height: 1.5; }
 
     .skeleton-row { height: 72px; background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.03) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .log-panel { background: rgba(0,0,0,0.3); border-radius: var(--radius); padding: 12px; margin-top: 16px; max-height: 200px; overflow-y: auto; font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted); }
+    .log-entry { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
 
     @media (max-width: 768px) {
       .glass-card { border-radius: var(--radius); margin: 12px; padding: 16px; }
@@ -146,8 +151,8 @@ const TRANSLATIONS = {
     heroTitle: 'Download smarter, faster 🍌', heroSub: 'Paste any Google Drive link to extract files, select episodes, and download with precision.',
     inputPlaceholder: 'Paste Google Drive URL here...', loadFiles: 'Load Files',
     selectAll: 'Select All', deselectAll: 'Deselect All', rangeLabel: 'Download episodes', to: 'to', searchPlaceholder: 'Search files...',
-    sort: 'Sort by', name: 'Name', size: 'Size', date: 'Date', downloadSelected: 'Download Selected', queuePanel: 'Download Queue',
-    downloading: 'Active', completed: 'Completed', failed: 'Failed',
+    sort: 'Sort by', name: 'Name', size: 'Size', date: 'Date', downloadSelected: 'Download Selected', downloadZip: 'Download as ZIP', queuePanel: 'Download Queue',
+    downloading: 'Active', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled',
     clearHistory: 'Clear History', confirmClear: 'Are you sure you want to clear all history?',
     fileName: 'File Name', status: 'Status', dateCol: 'Date',
     settingsTitle: 'Application Settings', language: 'Language', theme: 'Theme',
@@ -163,15 +168,18 @@ const TRANSLATIONS = {
     downloadSuccess: 'Download completed!', downloadFailed: 'Failed to download',
     bulkRename: 'Bulk Rename', bulkPlaceholder: 'Use # for number (0# for 01, 00# for 001)', applyBulk: 'Apply to Selected',
     proxyUrl: 'Custom CORS Proxy URL', proxyPlaceholder: 'https://cors-anywhere.herokuapp.com/ (Optional)',
-    retry: 'Retry', speed: 'Speed', eta: 'ETA', clearCompleted: 'Clear Completed'
+    retry: 'Retry', speed: 'Speed', eta: 'ETA', clearCompleted: 'Clear Completed',
+    cancel: 'Cancel', hide: 'Hide', show: 'Show', zipWarning: '⚠️ Total size exceeds 2GB. ZIP creation may take time and consume memory. Continue?',
+    shareTransfer: 'Share/Transfer', shareNote: 'Opens Google Drive official sharing interface',
+    preview: 'Preview', log: 'Activity Log'
   },
   ar: {
     appName: 'سيرفري بنانا 🍌', home: 'الرئيسية', history: 'السجل', settings: 'الإعدادات',
     heroTitle: 'حمّل بذكاء وسرعة 🍌', heroSub: 'الصق رابط Google Drive لاستخراج الملفات، اختر الحلقات، وحمل بدقة عالية.',
     inputPlaceholder: 'الصق رابط Google Drive هنا...', loadFiles: 'تحميل الملفات',
     selectAll: 'تحديد الكل', deselectAll: 'إلغاء التحديد', rangeLabel: 'تحميل الحلقات', to: 'إلى', searchPlaceholder: 'ابحث عن الملفات...',
-    sort: 'ترتيب حسب', name: 'الاسم', size: 'الحجم', date: 'التاريخ', downloadSelected: 'تحميل المحدد', queuePanel: 'قائمة التحميل',
-    downloading: 'نشط', completed: 'مكتمل', failed: 'فشل',
+    sort: 'ترتيب حسب', name: 'الاسم', size: 'الحجم', date: 'التاريخ', downloadSelected: 'تحميل المحدد', downloadZip: 'تحميل كملف ZIP', queuePanel: 'قائمة التحميل',
+    downloading: 'نشط', completed: 'مكتمل', failed: 'فشل', cancelled: 'ملغي',
     clearHistory: 'مسح السجل', confirmClear: 'هل أنت متأكد من مسح جميع السجلات؟',
     fileName: 'اسم الملف', status: 'الحالة', dateCol: 'التاريخ',
     settingsTitle: 'إعدادات التطبيق', language: 'اللغة', theme: 'المظهر',
@@ -187,7 +195,10 @@ const TRANSLATIONS = {
     downloadSuccess: 'اكتمل التحميل!', downloadFailed: 'فشل التحميل',
     bulkRename: 'تغيير الأسماء دفعة واحدة', bulkPlaceholder: 'استخدم # للرقم (0# لـ 01، 00# لـ 001)', applyBulk: 'تطبيق على المحدد',
     proxyUrl: 'رابط Proxy مخصص (CORS)', proxyPlaceholder: 'https://cors-anywhere.herokuapp.com/ (اختياري)',
-    retry: 'إعادة المحاولة', speed: 'السرعة', eta: 'الوقت المتبقي', clearCompleted: 'مسح المكتمل'
+    retry: 'إعادة المحاولة', speed: 'السرعة', eta: 'الوقت المتبقي', clearCompleted: 'مسح المكتمل',
+    cancel: 'إلغاء', hide: 'إخفاء', show: 'إظهار', zipWarning: '⚠️ الحجم الإجمالي يتجاوز 2GB. إنشاء ZIP قد يستغرق وقتاً ويستهلك ذاكرة. المتابعة؟',
+    shareTransfer: 'مشاركة/نقل', shareNote: 'يفتح واجهة Google Drive الرسمية لنقل الملف',
+    preview: 'معاينة', log: 'سجل النشاطات'
   }
 };
 
@@ -230,7 +241,7 @@ const LanguageProvider = ({ children }) => {
   return <LanguageContext.Provider value={{ lang, setLang, t, isRTL: lang === 'ar' }}>{children}</LanguageContext.Provider>;
 };
 
-const defaultSettings = { theme: 'dark', maxConcurrent: 2, chunkSize: '2MB', autoStart: true, notifications: false, apiKey: '', proxyUrl: '' };
+const defaultSettings = { theme: 'dark', maxConcurrent: 5, chunkSize: '2MB', autoStart: true, notifications: false, apiKey: '', proxyUrl: '' };
 
 const SettingsProvider = ({ children }) => {
   const [settings, setSettings] = useState(() => {
@@ -241,14 +252,14 @@ const SettingsProvider = ({ children }) => {
     localStorage.setItem('sb_settings', JSON.stringify(settings));
     document.body.className = settings.theme === 'light' ? 'light-theme' : '';
   }, [settings]);
-  const updateSetting = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
+  const updateSetting = (key, value) => setSettings(prev => ({ ...prev, [key]: Math.min(value, 5) })); // Enforce max 5
   return <SettingsContext.Provider value={{ settings, updateSetting }}>{children}</SettingsContext.Provider>;
 };
 
 // ==========================================
 // 4. DOWNLOAD REDUCER & CONTEXT
 // ==========================================
-const initialQueue = { tasks: [] };
+const initialQueue = { tasks: [], logs: [] };
 
 function queueReducer(state, action) {
   switch (action.type) {
@@ -260,21 +271,9 @@ function queueReducer(state, action) {
       updated[idx] = { ...updated[idx], ...action.payload };
       return { ...state, tasks: updated };
     }
-    case 'COMPLETE': {
-      const idx = state.tasks.findIndex(t => t.id === action.payload.id);
-      if (idx === -1) return state;
-      const updated = [...state.tasks];
-      updated[idx] = { ...updated[idx], status: 'completed', progress: 100 };
-      return { ...state, tasks: updated };
-    }
-    case 'FAIL': {
-      const idx = state.tasks.findIndex(t => t.id === action.payload.id);
-      if (idx === -1) return state;
-      const updated = [...state.tasks];
-      updated[idx] = { ...updated[idx], status: 'failed', progress: 0, error: action.payload.error };
-      return { ...state, tasks: updated };
-    }
-    case 'CLEAR_COMPLETED': return { ...state, tasks: state.tasks.filter(t => t.status !== 'completed') };
+    case 'LOG': return { ...state, logs: [...state.logs, { ...action.payload, time: new Date().toLocaleTimeString() }] };
+    case 'CLEAR_COMPLETED': return { ...state, tasks: state.tasks.filter(t => t.status !== 'completed' && t.status !== 'cancelled') };
+    case 'CLEAR_LOGS': return { ...state, logs: [] };
     default: return state;
   }
 }
@@ -331,10 +330,25 @@ const applyBulkRename = (pattern, files, customNames) => {
   const newNames = { ...customNames };
   files.forEach(f => {
     let num = extractEpisodeNumber(f.name) || 1;
-    let newName = pattern.replace(/(0*)#/, (match, zeros) => zeros + String(num).padStart(zeros.length, '0'));
+    let newName = pattern.replace(/(0*)#/g, (match, zeros) => {
+      const padLength = zeros.length > 0 ? zeros.length : 1;
+      return String(num).padStart(padLength, '0');
+    });
     newNames[f.id] = newName;
   });
   return newNames;
+};
+
+const generatePreview = (pattern, count = 3) => {
+  const samples = [];
+  for (let i = 1; i <= count; i++) {
+    let preview = pattern.replace(/(0*)#/g, (match, zeros) => {
+      const padLength = zeros.length > 0 ? zeros.length : 1;
+      return String(i).padStart(padLength, '0');
+    });
+    samples.push(preview);
+  }
+  return samples;
 };
 
 const cleanLocalStorage = () => {
@@ -373,15 +387,15 @@ const fetchRealFilesFromDrive = async (folderId, apiKey) => {
 // ==========================================
 // 6. COMPONENTS
 // ==========================================
-const ProgressBar = ({ progress, status, speed, eta }) => {
+const ProgressBar = ({ progress, status }) => {
   const getColor = () => {
     if (status === 'completed') return 'var(--success)';
-    if (status === 'failed') return 'var(--danger)';
+    if (status === 'failed' || status === 'cancelled') return 'var(--danger)';
     return 'linear-gradient(90deg, var(--primary), var(--secondary))';
   };
   return (
     <div className="progress-container">
-      <div className="progress-bar" style={{ width: `${Math.min(progress, 100)}%`, background: status === 'completed' || status === 'failed' ? getColor() : undefined }} />
+      <div className="progress-bar" style={{ width: `${Math.min(progress, 100)}%`, background: status === 'completed' || status === 'failed' || status === 'cancelled' ? getColor() : undefined }} />
     </div>
   );
 };
@@ -415,6 +429,7 @@ const FileList = ({ files, onSelect, selected, search, sort, range, customNames,
 
   const startEdit = (file) => { setEditingId(file.id); setEditValue(customNames[file.id] || file.name); };
   const saveEdit = () => { if (editingId && editValue.trim()) onRename(editingId, editValue.trim()); setEditingId(null); };
+  const handleShare = (id) => { window.open(`https://drive.google.com/file/d/${id}/view?usp=sharing`, '_blank'); };
 
   return (
     <div ref={containerRef} onScroll={handleScroll} className="scrollbar" style={{ maxHeight: '500px', overflowY: 'auto', position: 'relative' }}>
@@ -439,6 +454,7 @@ const FileList = ({ files, onSelect, selected, search, sort, range, customNames,
                     )}
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{formatBytes(f.size)} • {f.type.split('/')[1].toUpperCase()}</div>
                   </div>
+                  <button onClick={(e) => { e.stopPropagation(); handleShare(f.id); }} className="btn-ghost btn-icon" title={t('shareTransfer')} style={{ width: 32, height: 32, fontSize: '1rem' }}>🔗</button>
                 </div>
               );
             })}
@@ -490,6 +506,8 @@ const HomePage = ({ onNavigate }) => {
   const [customNames, setCustomNames] = useState({});
   const [bulkPattern, setBulkPattern] = useState('[AnimeSpace] OV EP#');
   const abortControllers = useRef(new Map());
+  const activeSlots = useRef(0);
+  const MAX_CONCURRENT = 5;
 
   useEffect(() => { cleanLocalStorage(); }, []);
 
@@ -521,11 +539,13 @@ const HomePage = ({ onNavigate }) => {
     addToast(`Renamed ${selectedFiles.length} files using pattern`, 'success');
   };
 
-  const downloadFile = useCallback(async (file, finalName) => {
+  // ✅ FIXED DOWNLOAD ENGINE
+  const downloadFile = useCallback(async (file, finalName, isZip = false) => {
     const controller = new AbortController();
     abortControllers.current.set(file.id, controller);
     
     dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'downloading', progress: 5, startTime: Date.now(), bytesDownloaded: 0 } });
+    dispatch({ type: 'LOG', payload: { id: file.id, message: `Started downloading ${finalName}` } });
 
     try {
       let driveUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&key=${settings.apiKey}`;
@@ -546,14 +566,16 @@ const HomePage = ({ onNavigate }) => {
         if (done) break;
         chunks.push(value);
         loaded += value.length;
+        
         const progress = total ? Math.round((loaded / total) * 100) : 95;
-        const speed = loaded / ((Date.now() - (state.tasks.find(t => t.id === file.id)?.startTime || Date.now())) / 1000) || 0;
+        const elapsed = (Date.now() - (state.tasks.find(t => t.id === file.id)?.startTime || Date.now())) / 1000;
+        const speed = elapsed > 0 ? loaded / elapsed : 0;
         const eta = speed > 0 ? (total - loaded) / speed : 0;
         
         dispatch({ type: 'UPDATE', payload: { id: file.id, progress, speed, eta, bytesDownloaded: loaded } });
       }
 
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) return null;
 
       const mimeType = file.type || 'application/octet-stream';
       const blob = new Blob(chunks, { type: mimeType });
@@ -564,47 +586,111 @@ const HomePage = ({ onNavigate }) => {
       a.download = finalName;
       document.body.appendChild(a);
       a.click();
-      
       document.body.removeChild(a);
       URL.revokeObjectURL(downloadUrl);
-      dispatch({ type: 'COMPLETE', payload: { id: file.id } });
+
+      dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'completed', progress: 100 } });
+      dispatch({ type: 'LOG', payload: { id: file.id, message: `✓ Completed ${finalName}` } });
+      return blob; // Return blob for ZIP
     } catch (err) {
-      if (err.name === 'AbortError') return;
+      if (err.name === 'AbortError') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'cancelled' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `⛔ Cancelled ${finalName}` } });
+        return null;
+      }
       if (err.message === 'HTML_WARNING_PAGE' || err.message.includes('Failed to fetch')) {
         dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'failed', error: t('htmlBlocked') } });
         setTimeout(() => window.open(`https://drive.google.com/uc?export=download&id=${file.id}`, '_blank'), 1000);
       } else {
-        dispatch({ type: 'FAIL', payload: { id: file.id, error: t('downloadFailed') } });
+        dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'failed', error: t('downloadFailed') } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ Failed ${finalName}: ${err.message}` } });
       }
+      return null;
     } finally {
       abortControllers.current.delete(file.id);
     }
   }, [settings.apiKey, settings.proxyUrl, dispatch, state.tasks, t]);
 
-  const handleDownload = async () => {
+  // ✅ QUEUE MANAGER WITH 5 LIMIT
+  const processQueue = useCallback(async () => {
     const toDownload = files.filter(f => selected.has(f.id));
-    if (toDownload.length === 0) { addToast('No files selected', 'warning'); return; }
-    if (!settings.apiKey) { addToast('API Key is required for direct download!', 'error'); return; }
+    if (toDownload.length === 0) return;
 
-    const max = Math.min(settings.maxConcurrent || 2, 8);
-    dispatch({ type: 'ADD', payload: toDownload.map(f => ({ ...f, status: 'queued', progress: 0, customName: customNames[f.id] || f.name })) });
-    addToast(`Starting ${toDownload.length} downloads (Max ${max} concurrent)...`, 'warning');
+    const tasks = toDownload.map(f => ({ ...f, status: 'queued', progress: 0, customName: customNames[f.id] || f.name, isHidden: false }));
+    dispatch({ type: 'ADD', payload: tasks });
+    addToast(`Started ${tasks.length} downloads (Max ${MAX_CONCURRENT} concurrent)`, 'warning');
 
-    const queue = [...toDownload];
+    const queue = [...tasks];
     const active = [];
 
-    const process = async () => {
-      while (queue.length > 0 && active.length < max) {
-        const file = queue.shift();
-        const finalName = customNames[file.id] || file.name;
-        const p = downloadFile(file, finalName).finally(() => active.splice(active.indexOf(p), 1));
+    const runNext = async () => {
+      while (queue.length > 0) {
+        const task = queue.shift();
+        const finalName = task.customName || task.name;
+        
+        dispatch({ type: 'UPDATE', payload: { id: task.id, status: 'downloading', progress: 0 } });
+        const p = downloadFile(task, finalName).finally(() => {
+          const idx = active.indexOf(p);
+          if (idx !== -1) active.splice(idx, 1);
+          runNext(); // Schedule next
+        });
         active.push(p);
-        if (queue.length > 0) await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 800)); // Small delay to prevent API flooding
       }
-      await Promise.all(active);
     };
-    process();
-  };
+
+    // Start up to MAX_CONCURRENT
+    for (let i = 0; i < Math.min(MAX_CONCURRENT, queue.length); i++) runNext();
+  }, [files, selected, customNames, downloadFile, addToast, dispatch]);
+
+  const handleDownload = useCallback(() => processQueue(), [processQueue]);
+
+  // ✅ ZIP DOWNLOAD
+  const handleZipDownload = useCallback(async () => {
+    const toDownload = files.filter(f => selected.has(f.id));
+    if (toDownload.length === 0) return;
+
+    const totalSize = toDownload.reduce((acc, f) => acc + (f.size || 0), 0);
+    if (totalSize > 2 * 1024 * 1024 * 1024) { // 2GB
+      if (!confirm(t('zipWarning'))) return;
+    }
+
+    addToast('Creating ZIP archive... Please wait.', 'warning');
+    const zip = new JSZip();
+    const folder = zip.folder("SerfryDownloads");
+
+    for (const file of toDownload) {
+      const finalName = customNames[file.id] || file.name;
+      const blob = await downloadFile(file, finalName, true);
+      if (blob) {
+        folder.file(finalName, blob);
+        dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'completed' } });
+      }
+    }
+
+    try {
+      const content = await zip.generateAsync({ type: "blob" });
+      FileSaver.saveAs(content, "Serfry_Banana_Archive.zip");
+      addToast('ZIP created and downloaded!', 'success');
+    } catch (err) {
+      addToast('Failed to create ZIP. File might be too large.', 'error');
+    }
+  }, [files, selected, customNames, downloadFile, addToast, dispatch, t]);
+
+  // ✅ CANCEL & HIDE
+  const handleCancel = useCallback((id) => {
+    const ctrl = abortControllers.current.get(id);
+    if (ctrl) ctrl.abort();
+    else {
+      dispatch({ type: 'UPDATE', payload: { id, status: 'cancelled' } });
+      dispatch({ type: 'LOG', payload: { id, message: `⛔ Cancelled via UI` } });
+    }
+  }, [dispatch]);
+
+  const toggleHide = useCallback((id) => {
+    dispatch({ type: 'UPDATE', payload: { id, isHidden: true } });
+    dispatch({ type: 'LOG', payload: { id, message: `👁️ Hidden from UI` } });
+  }, [dispatch]);
 
   const handleRetry = (task) => {
     abortControllers.current.delete(task.id);
@@ -613,6 +699,12 @@ const HomePage = ({ onNavigate }) => {
   };
 
   const totalSelectedSize = useMemo(() => Array.from(selected).reduce((acc, id) => { const file = files.find(f => f.id === id); return acc + (file ? file.size : 0); }, 0), [selected, files]);
+  const previewSamples = useMemo(() => generatePreview(bulkPattern), [bulkPattern]);
+
+  const visibleTasks = state.tasks.filter(t => !t.isHidden);
+  const activeCount = visibleTasks.filter(t => t.status === 'downloading').length;
+  const completedCount = visibleTasks.filter(t => t.status === 'completed').length;
+  const failedCount = visibleTasks.filter(t => t.status === 'failed' || t.status === 'cancelled').length;
 
   return (
     <div className="animate-fade" style={{ padding: '24px', maxWidth: '1400px', margin: '0 auto' }}>
@@ -640,6 +732,7 @@ const HomePage = ({ onNavigate }) => {
             <span style={{ fontWeight: 600, color: 'var(--primary)' }}>🏷️ {t('bulkRename')}:</span>
             <input type="text" value={bulkPattern} onChange={e => setBulkPattern(e.target.value)} placeholder={t('bulkPlaceholder')} />
             <button onClick={handleBulkRename} className="btn-ghost" style={{ minWidth: '120px' }}>{t('applyBulk')}</button>
+            <div className="preview-box">{t('preview')}: {previewSamples.join(' | ')}</div>
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '20px', marginBottom: '24px' }}>
@@ -669,45 +762,55 @@ const HomePage = ({ onNavigate }) => {
               <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{selected.size} {t('filesSelected')}</div>
               <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>{t('totalSize')}: {formatBytes(totalSelectedSize)}</div>
             </div>
-            <button onClick={handleDownload} className="btn-primary" style={{ padding: '16px 40px', fontSize: '1.1rem' }}>{t('downloadSelected')} ({selected.size})</button>
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button onClick={handleDownload} className="btn-primary" style={{ padding: '16px 40px', fontSize: '1.1rem' }}>{t('downloadSelected')} ({selected.size})</button>
+              <button onClick={handleZipDownload} className="btn-ghost" style={{ padding: '16px 40px', fontSize: '1.1rem' }}>{t('downloadZip')} 📦</button>
+            </div>
           </div>
         </div>
       )}
 
-      {state.tasks.length > 0 && (
+      {visibleTasks.length > 0 && (
         <div className="glass-card" style={{ padding: '28px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
             <h3 style={{ fontSize: '1.5rem', fontWeight: 700 }}>{t('queuePanel')}</h3>
             <button onClick={() => dispatch({ type: 'CLEAR_COMPLETED' })} className="btn-ghost" style={{ fontSize: '0.85rem' }}>{t('clearCompleted')}</button>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '16px', marginBottom: '24px' }}>
-            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--text-muted)' }}>{state.tasks.filter(t => t.status === 'downloading').length}</div><div className="stat-label">{t('downloading')}</div></div>
-            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--success)' }}>{state.tasks.filter(t => t.status === 'completed').length}</div><div className="stat-label">{t('completed')}</div></div>
-            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--danger)' }}>{state.tasks.filter(t => t.status === 'failed').length}</div><div className="stat-label">{t('failed')}</div></div>
+            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--text-muted)' }}>{activeCount}</div><div className="stat-label">{t('downloading')}</div></div>
+            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--success)' }}>{completedCount}</div><div className="stat-label">{t('completed')}</div></div>
+            <div className="stat-card"><div className="stat-value" style={{ color: 'var(--danger)' }}>{failedCount}</div><div className="stat-label">{t('failed')}/{t('cancelled')}</div></div>
           </div>
           <div className="scrollbar" style={{ maxHeight: '400px', overflowY: 'auto' }}>
-            {state.tasks.map(task => (
-              <div key={task.id} style={{ padding: '20px', marginBottom: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: task.status === 'completed' ? '1px solid var(--success)' : task.status === 'failed' ? '1px solid var(--danger)' : '1px solid rgba(255,255,255,0.05)', transition: 'all 0.2s' }}>
+            {visibleTasks.map(task => (
+              <div key={task.id} style={{ padding: '20px', marginBottom: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: task.status === 'completed' ? '1px solid var(--success)' : task.status === 'failed' || task.status === 'cancelled' ? '1px solid var(--danger)' : '1px solid rgba(255,255,255,0.05)', transition: 'all 0.2s' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap', gap: '8px' }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 600, marginBottom: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text)' }}>{task.customName || task.name}</div>
                     <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                      {task.status === 'completed' ? '✓ Saved' : task.status === 'failed' ? `✕ ${task.error}` : `${task.progress}% | ${t('speed')}: ${formatBytes(task.speed || 0)}/s | ${t('eta')}: ${formatTime(task.eta)}`}
+                      {task.status === 'completed' ? '✓ Saved' : task.status === 'cancelled' ? '⛔ Cancelled' : task.status === 'failed' ? `✕ ${task.error || 'Error'}` : `${task.progress}% | ${t('speed')}: ${formatBytes(task.speed || 0)}/s | ${t('eta')}: ${formatTime(task.eta)}`}
                     </div>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <div style={{ fontSize: '1.2rem', fontWeight: 700, color: task.status === 'completed' ? 'var(--success)' : task.status === 'failed' ? 'var(--danger)' : 'var(--primary)', minWidth: '60px', textAlign: 'right' }}>
-                      {task.status === 'completed' ? '✓' : task.status === 'failed' ? '✕' : `${task.progress}%`}
-                    </div>
-                    {task.status === 'failed' && (
-                      <button onClick={() => handleRetry(task)} className="btn-ghost" style={{ padding: '4px 10px', fontSize: '0.8rem' }}>{t('retry')}</button>
-                    )}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    {task.status === 'downloading' && <button onClick={() => handleCancel(task.id)} className="btn-ghost" title={t('cancel')} style={{ padding: '4px 8px', fontSize: '0.8rem' }}>⛔</button>}
+                    {task.status === 'failed' && <button onClick={() => handleRetry(task)} className="btn-ghost" title={t('retry')} style={{ padding: '4px 8px', fontSize: '0.8rem' }}>🔄</button>}
+                    <button onClick={() => toggleHide(task.id)} className="btn-ghost" title={t('hide')} style={{ padding: '4px 8px', fontSize: '0.8rem' }}>👁️</button>
                   </div>
                 </div>
-                <ProgressBar progress={task.progress} status={task.status} speed={task.speed} eta={task.eta} />
+                <ProgressBar progress={task.progress} status={task.status} />
               </div>
             ))}
           </div>
+
+          {state.logs.length > 0 && (
+            <div className="log-panel">
+              // ✅ الكود الصحيح
+<div style={{ fontWeight: 600, marginBottom: '8px', color: 'var(--primary)' }}>{t('log')}</div>
+              {state.logs.slice(-20).reverse().map((log, i) => (
+                <div key={i} className="log-entry">[{log.time}] {log.message}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -783,9 +886,10 @@ const SettingsPage = () => {
         <button onClick={() => updateSetting('theme', settings.theme === 'dark' ? 'light' : 'dark')} className="btn-ghost" style={{ padding: '14px', textAlign: 'left' }}>{settings.theme === 'dark' ? '☀️ ' + t('light') : '🌙 ' + t('dark')}</button>
       </SettingCard>
       <SettingCard title={t('maxConcurrent')} icon="⚡">
-        <select value={settings.maxConcurrent} onChange={e => updateSetting('maxConcurrent', Math.min(parseInt(e.target.value), 8))} style={{ width: '150px', padding: '14px' }}>
-          {[1, 2, 3, 4, 5, 8].map(n => <option key={n} value={n}>{n} {t('downloading')}</option>)}
+        <select value={settings.maxConcurrent} onChange={e => updateSetting('maxConcurrent', Math.min(parseInt(e.target.value), 5))} style={{ width: '150px', padding: '14px' }}>
+          {[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n} {t('downloading')}</option>)}
         </select>
+        <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>System limit enforced: max 5</p>
       </SettingCard>
       <SettingCard title={t('about')} icon="ℹ️">
         <p style={{ color: 'var(--text-muted)', marginBottom: '8px' }}>{t('poweredBy')}</p>
