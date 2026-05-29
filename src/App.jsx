@@ -203,7 +203,21 @@ const TRANSLATIONS = {
 };
 
 // ==========================================
-// 3. CONTEXTS & PROVIDERS
+// 3. SAFE STORAGE UTILITY (CRASH FIX)
+// ==========================================
+const safeGetLS = (key, fallback) => {
+  try {
+    const saved = localStorage.getItem(key);
+    return saved ? JSON.parse(saved) : fallback;
+  } catch (e) {
+    console.warn(`⚠️ Corrupted storage: ${key}. Resetting to default.`);
+    localStorage.removeItem(key);
+    return fallback;
+  }
+};
+
+// ==========================================
+// 4. CONTEXTS & PROVIDERS
 // ==========================================
 const LanguageContext = createContext();
 const SettingsContext = createContext();
@@ -235,7 +249,7 @@ const ToastProvider = ({ children }) => {
 };
 
 const LanguageProvider = ({ children }) => {
-  const [lang, setLang] = useState(() => localStorage.getItem('sb_lang') || 'ar');
+  const [lang, setLang] = useState(() => safeGetLS('sb_lang', 'ar'));
   useEffect(() => { localStorage.setItem('sb_lang', lang); }, [lang]);
   const t = (key) => TRANSLATIONS[lang]?.[key] || key;
   return <LanguageContext.Provider value={{ lang, setLang, t, isRTL: lang === 'ar' }}>{children}</LanguageContext.Provider>;
@@ -244,20 +258,17 @@ const LanguageProvider = ({ children }) => {
 const defaultSettings = { theme: 'dark', maxConcurrent: 5, chunkSize: '2MB', autoStart: true, notifications: false, apiKey: '', proxyUrl: '' };
 
 const SettingsProvider = ({ children }) => {
-  const [settings, setSettings] = useState(() => {
-    const saved = localStorage.getItem('sb_settings');
-    return saved ? { ...defaultSettings, ...JSON.parse(saved) } : defaultSettings;
-  });
+  const [settings, setSettings] = useState(() => safeGetLS('sb_settings', defaultSettings));
   useEffect(() => {
     localStorage.setItem('sb_settings', JSON.stringify(settings));
     document.body.className = settings.theme === 'light' ? 'light-theme' : '';
   }, [settings]);
-  const updateSetting = (key, value) => setSettings(prev => ({ ...prev, [key]: Math.min(value, 5) })); // Enforce max 5
+  const updateSetting = (key, value) => setSettings(prev => ({ ...prev, [key]: key === 'maxConcurrent' ? Math.min(value, 5) : value }));
   return <SettingsContext.Provider value={{ settings, updateSetting }}>{children}</SettingsContext.Provider>;
 };
 
 // ==========================================
-// 4. DOWNLOAD REDUCER & CONTEXT
+// 5. DOWNLOAD REDUCER & CONTEXT
 // ==========================================
 const initialQueue = { tasks: [], logs: [] };
 
@@ -279,16 +290,13 @@ function queueReducer(state, action) {
 }
 
 const DownloadProvider = ({ children }) => {
-  const [state, dispatch] = useReducer(queueReducer, initialQueue, () => {
-    const saved = localStorage.getItem('sb_queue');
-    return saved ? JSON.parse(saved) : initialQueue;
-  });
+  const [state, dispatch] = useReducer(queueReducer, initialQueue, () => safeGetLS('sb_queue', initialQueue));
   useEffect(() => { localStorage.setItem('sb_queue', JSON.stringify(state)); }, [state]);
   return <DownloadContext.Provider value={{ state, dispatch }}>{children}</DownloadContext.Provider>;
 };
 
 // ==========================================
-// 5. UTILITIES
+// 6. UTILITIES
 // ==========================================
 const parseDriveLink = (url) => {
   const match = url.match(/\/folders\/([a-zA-Z0-9_-]+)/) || url.match(/id=([a-zA-Z0-9_-]+)/);
@@ -354,13 +362,15 @@ const generatePreview = (pattern, count = 3) => {
 const cleanLocalStorage = () => {
   const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
   ['sb_history', 'sb_queue'].forEach(key => {
-    const saved = localStorage.getItem(key);
-    if (!saved) return;
     try {
+      const saved = localStorage.getItem(key);
+      if (!saved) return;
       const data = JSON.parse(saved);
-      const cleaned = Array.isArray(data) ? data.filter(item => new Date(item.date || item.createdAt || Date.now()) > thirtyDaysAgo) : data;
-      if (Array.isArray(cleaned)) localStorage.setItem(key, JSON.stringify(cleaned));
-    } catch (e) { console.warn('Cleanup failed for', key, e); }
+      if (Array.isArray(data)) {
+        const cleaned = data.filter(item => new Date(item.date || item.createdAt || Date.now()) > thirtyDaysAgo);
+        if (cleaned.length !== data.length) localStorage.setItem(key, JSON.stringify(cleaned));
+      }
+    } catch (e) { localStorage.removeItem(key); }
   });
 };
 
@@ -385,7 +395,7 @@ const fetchRealFilesFromDrive = async (folderId, apiKey) => {
 };
 
 // ==========================================
-// 6. COMPONENTS
+// 7. COMPONENTS
 // ==========================================
 const ProgressBar = ({ progress, status }) => {
   const getColor = () => {
@@ -506,7 +516,6 @@ const HomePage = ({ onNavigate }) => {
   const [customNames, setCustomNames] = useState({});
   const [bulkPattern, setBulkPattern] = useState('[AnimeSpace] OV EP#');
   const abortControllers = useRef(new Map());
-  const activeSlots = useRef(0);
   const MAX_CONCURRENT = 5;
 
   useEffect(() => { cleanLocalStorage(); }, []);
@@ -539,7 +548,6 @@ const HomePage = ({ onNavigate }) => {
     addToast(`Renamed ${selectedFiles.length} files using pattern`, 'success');
   };
 
-  // ✅ FIXED DOWNLOAD ENGINE
   const downloadFile = useCallback(async (file, finalName, isZip = false) => {
     const controller = new AbortController();
     abortControllers.current.set(file.id, controller);
@@ -591,7 +599,7 @@ const HomePage = ({ onNavigate }) => {
 
       dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'completed', progress: 100 } });
       dispatch({ type: 'LOG', payload: { id: file.id, message: `✓ Completed ${finalName}` } });
-      return blob; // Return blob for ZIP
+      return blob;
     } catch (err) {
       if (err.name === 'AbortError') {
         dispatch({ type: 'UPDATE', payload: { id: file.id, status: 'cancelled' } });
@@ -611,7 +619,6 @@ const HomePage = ({ onNavigate }) => {
     }
   }, [settings.apiKey, settings.proxyUrl, dispatch, state.tasks, t]);
 
-  // ✅ QUEUE MANAGER WITH 5 LIMIT
   const processQueue = useCallback(async () => {
     const toDownload = files.filter(f => selected.has(f.id));
     if (toDownload.length === 0) return;
@@ -627,31 +634,28 @@ const HomePage = ({ onNavigate }) => {
       while (queue.length > 0) {
         const task = queue.shift();
         const finalName = task.customName || task.name;
-        
         dispatch({ type: 'UPDATE', payload: { id: task.id, status: 'downloading', progress: 0 } });
         const p = downloadFile(task, finalName).finally(() => {
           const idx = active.indexOf(p);
           if (idx !== -1) active.splice(idx, 1);
-          runNext(); // Schedule next
+          runNext();
         });
         active.push(p);
-        await new Promise(r => setTimeout(r, 800)); // Small delay to prevent API flooding
+        await new Promise(r => setTimeout(r, 800));
       }
     };
 
-    // Start up to MAX_CONCURRENT
     for (let i = 0; i < Math.min(MAX_CONCURRENT, queue.length); i++) runNext();
   }, [files, selected, customNames, downloadFile, addToast, dispatch]);
 
   const handleDownload = useCallback(() => processQueue(), [processQueue]);
 
-  // ✅ ZIP DOWNLOAD
   const handleZipDownload = useCallback(async () => {
     const toDownload = files.filter(f => selected.has(f.id));
     if (toDownload.length === 0) return;
 
     const totalSize = toDownload.reduce((acc, f) => acc + (f.size || 0), 0);
-    if (totalSize > 2 * 1024 * 1024 * 1024) { // 2GB
+    if (totalSize > 2 * 1024 * 1024 * 1024) {
       if (!confirm(t('zipWarning'))) return;
     }
 
@@ -677,7 +681,6 @@ const HomePage = ({ onNavigate }) => {
     }
   }, [files, selected, customNames, downloadFile, addToast, dispatch, t]);
 
-  // ✅ CANCEL & HIDE
   const handleCancel = useCallback((id) => {
     const ctrl = abortControllers.current.get(id);
     if (ctrl) ctrl.abort();
@@ -820,7 +823,7 @@ const HomePage = ({ onNavigate }) => {
 const HistoryPage = () => {
   const { t } = useContext(LanguageContext);
   const { addToast } = useContext(ToastContext);
-  const [history, setHistory] = useState(() => JSON.parse(localStorage.getItem('sb_history') || '[]'));
+  const [history, setHistory] = useState(() => safeGetLS('sb_history', []));
   const clear = () => { if (window.confirm(t('confirmClear'))) { setHistory([]); localStorage.removeItem('sb_history'); addToast('History cleared', 'success'); } };
   return (
     <div className="animate-fade" style={{ padding: '24px', maxWidth: '1200px', margin: '0 auto' }}>
@@ -900,7 +903,7 @@ const SettingsPage = () => {
 };
 
 // ==========================================
-// 7. ERROR BOUNDARY
+// 8. ERROR BOUNDARY
 // ==========================================
 class ErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { hasError: false }; }
@@ -913,7 +916,7 @@ class ErrorBoundary extends React.Component {
 }
 
 // ==========================================
-// 8. MAIN APP
+// 9. MAIN APP
 // ==========================================
 export default function App() {
   const [activeTab, setActiveTab] = useState('home');
