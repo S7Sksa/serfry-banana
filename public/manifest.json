@@ -1,0 +1,13 @@
+{
+  "name": "Serfry Banana 🍌",
+  "short_name": "Serfry",
+  "description": "Drive downloads, peeled and ready. Bulk rename, ZIP export, and smart batch downloads.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0C0B09",
+  "theme_color": "#FFC700",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

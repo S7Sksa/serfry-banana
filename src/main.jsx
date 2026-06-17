@@ -3,11 +3,13 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
 
-// 🚀 PWA Service Worker Registration
+// 📲 PWA Service Worker Registration
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
-      .catch(() => console.log('📱 Service Worker registration skipped'));
+    navigator.serviceWorker
+      .register('/sw.js')
+      .then((reg) => console.log('✅ SW registered:', reg.scope))
+      .catch((err) => console.error('❌ SW failed:', err));
   });
 }
 
