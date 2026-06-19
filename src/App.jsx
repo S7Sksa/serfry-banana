@@ -1368,6 +1368,11 @@ const HomePage = ({ onNavigate }) => {
           await sleep(delay);
           return fetchWithConfirm(fileId, apiKey, rangeStart, attempt + 1);
         }
+        // After 3 retries the SAME network error persists → this is structural, not transient.
+        // Almost always: CORS block (no proxy configured) or API key restricted to wrong referrers.
+        if (isNetworkErr && attempt >= 4 && !settings.proxyUrl) {
+          throw new Error('CORS_LIKELY');
+        }
         throw fetchErr;
       }
       const contentType = response.headers.get('content-type') || '';
@@ -1516,6 +1521,9 @@ const HomePage = ({ onNavigate }) => {
       if (err.message === 'HTML_WARNING_PAGE') {
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: t('htmlBlocked') } });
         if (!isZip) setTimeout(() => window.open(`https://drive.google.com/uc?export=download&confirm=t&id=${file.id}`, '_blank', 'noopener'), 600);
+      } else if (err.message === 'CORS_LIKELY') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ الطلبات تُحظر باستمرار — غالباً CORS أو قيود مفتاح API. فعّل CORS proxy في الإعدادات.' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: CORS_LIKELY — same network error after 3 retries, no proxy configured` } });
       } else if (err.message?.startsWith('TIMEOUT_') || err.message?.startsWith('STALL')) {
         const label = err.message.includes('STALL') ? 'توقف التحميل (stall)' : 'انتهت مدة الاتصال (timeout)';
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: label } });
@@ -2151,6 +2159,14 @@ const SettingsPage = () => {
  
       <SettingCard title={t('proxyUrl')} icon={<Wifi size={17} />} note={t('proxyNote')}>
         <input type="text" placeholder={t('proxyPlaceholder')} value={settings.proxyUrl} onChange={e => updateSetting('proxyUrl', e.target.value)} className="mono" />
+        <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
+          <button onClick={() => updateSetting('proxyUrl', 'https://corsproxy.io/?url=')} className="btn-ghost btn-sm" type="button">corsproxy.io</button>
+          <button onClick={() => updateSetting('proxyUrl', 'https://api.allorigins.win/raw?url=')} className="btn-ghost btn-sm" type="button">allorigins.win</button>
+          {settings.proxyUrl && <button onClick={() => updateSetting('proxyUrl', '')} className="btn-ghost btn-sm" type="button">{t('accentReset') || 'مسح'}</button>}
+        </div>
+        <p style={{ fontSize: '0.72rem', color: 'var(--text-faint)', marginTop: '8px' }}>
+          لو التحميلات تفشل باستمرار بنفس الخطأ "Failed to fetch"، فعّل أحد البروكسيات أعلاه.
+        </p>
       </SettingCard>
  
       <SettingCard title={t('notifications')} icon={settings.notifications ? <Bell size={17} /> : <BellOff size={17} />} note={t('notificationsNote')}>
