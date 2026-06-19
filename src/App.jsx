@@ -530,6 +530,15 @@ const safeLSSetRaw = (key, value) => {
 const safeLSRemove = (key) => {
   try { localStorage.removeItem(key); } catch {}
 };
+
+// Notification API is missing entirely on some mobile browsers (e.g. Brave iOS),
+// not just permission-denied — so every access must be guarded, not just checked.
+const hasNotificationAPI = () => {
+  try { return typeof window !== 'undefined' && 'Notification' in window; } catch { return false; }
+};
+const getNotifPermission = () => {
+  try { return hasNotificationAPI() ? Notification.permission : 'unsupported'; } catch { return 'unsupported'; }
+};
  
 // ==========================================
 // 5. CONTEXTS & PROVIDERS
@@ -703,7 +712,7 @@ const DownloadProvider = ({ children }) => {
 // ==========================================
 const notify = (title, body, tag = 'serfry-banana') => {
   try {
-    if (typeof Notification === 'undefined') return;
+    if (!hasNotificationAPI()) return;
     if (Notification.permission === 'granted') new Notification(title, { body, tag });
   } catch {}
 };
@@ -1121,18 +1130,26 @@ const HomePage = ({ onNavigate }) => {
   const handleShareFolder = useCallback(() => {
     if (!url) return;
     const shareUrl = `${window.location.origin}${window.location.pathname}?folder=${encodeURIComponent(url)}`;
-    navigator.clipboard.writeText(shareUrl).then(() => {
-      addToast(t('shareFolderCopied'), 'success');
-    }).catch(() => {
-      // Fallback
-      const el = document.createElement('textarea');
-      el.value = shareUrl;
-      document.body.appendChild(el);
-      el.select();
-      document.execCommand('copy');
-      document.body.removeChild(el);
-      addToast(t('shareFolderCopied'), 'success');
-    });
+    const fallbackCopy = () => {
+      try {
+        const el = document.createElement('textarea');
+        el.value = shareUrl;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+        addToast(t('shareFolderCopied'), 'success');
+      } catch {
+        addToast(shareUrl, 'warning'); // last resort: show the link itself
+      }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(shareUrl).then(() => {
+        addToast(t('shareFolderCopied'), 'success');
+      }).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
   }, [url, addToast, t]);
   const batchIdRef = useRef(0);
  
@@ -1151,7 +1168,9 @@ const HomePage = ({ onNavigate }) => {
       setNetworkSpeed(speed);
       if (speed === 'slow') addToast(t('networkSlowWarn'), 'warning');
     });
-    if (Notification.permission === 'default') Notification.requestPermission();
+    if (hasNotificationAPI() && getNotifPermission() === 'default') {
+      try { Notification.requestPermission(); } catch {}
+    }
   }, []);
  
   // ── Favorites ──────────────────────────────────────────────
@@ -2055,16 +2074,18 @@ const SettingsPage = () => {
   const { t, lang, setLang } = useContext(LanguageContext);
   const { settings, updateSetting, resetSettings } = useContext(SettingsContext);
   const { addToast } = useContext(ToastContext);
-  const [notifPermission, setNotifPermission] = useState(() => (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'));
+  const [notifPermission, setNotifPermission] = useState(() => getNotifPermission());
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [apiKeySet, setApiKeySet] = useState(() => !!safeLSGetRaw('sb_apikey_enc'));
   const [showKey, setShowKey] = useState(false);
  
   const requestNotifPermission = async () => {
-    if (typeof Notification === 'undefined') return;
-    const result = await Notification.requestPermission();
-    setNotifPermission(result);
-    if (result === 'granted') updateSetting('notifications', true);
+    if (!hasNotificationAPI()) return;
+    try {
+      const result = await Notification.requestPermission();
+      setNotifPermission(result);
+      if (result === 'granted') updateSetting('notifications', true);
+    } catch {}
   };
  
   const handleNotifToggle = (val) => {
