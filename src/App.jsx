@@ -1344,34 +1344,59 @@ const HomePage = ({ onNavigate }) => {
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-    const fetchWithConfirm = async (fileId, apiKey, rangeStart = 0, attempt = 1) => {
+    // List of candidate URLs to try in order: direct first (works if API key
+    // allows it), then each known CORS proxy. We cycle through all of them
+    // before giving up, instead of retrying the SAME broken URL repeatedly.
+    const buildCandidateUrls = (fileId, apiKey) => {
+      const base = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
+      const candidates = [];
+      if (settings.proxyUrl) {
+        // User-configured proxy goes first if set
+        candidates.push(`${settings.proxyUrl}${encodeURIComponent(base)}`);
+      }
+      candidates.push(base); // direct (works for many API keys / browsers)
+      candidates.push(`https://corsproxy.io/?url=${encodeURIComponent(base)}`);
+      candidates.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(base)}`);
+      // De-dupe in case user's proxy matches one of the defaults
+      return [...new Set(candidates)];
+    };
+
+    const fetchWithConfirm = async (fileId, apiKey, rangeStart = 0, urlIndex = 0, attemptAtThisUrl = 1) => {
       const headers = {};
-      if (rangeStart > 0) headers['Range'] = `bytes=${rangeStart}-`;
+      // NOTE: Range header is dropped automatically below for proxied requests,
+      // since most free CORS proxies strip/ignore custom request headers.
+      const candidates = buildCandidateUrls(fileId, apiKey);
+      const url = candidates[urlIndex];
+      const isProxied = url !== `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
+      if (rangeStart > 0 && !isProxied) headers['Range'] = `bytes=${rangeStart}-`;
 
-      let url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
-      if (settings.proxyUrl) url = `${settings.proxyUrl}${encodeURIComponent(url)}`;
-
-      // Auto-retry network errors (Failed to fetch / TypeError) up to 3 times
       let response;
       try {
         response = await withTimeout(
           fetch(url, { signal: controller.signal, headers }),
-          20_000, 'CONNECT'
+          15_000, 'CONNECT'
         );
       } catch (fetchErr) {
         const isNetworkErr = fetchErr instanceof TypeError || fetchErr.message === 'Failed to fetch' || fetchErr.message?.includes('network');
         const isTimeout = fetchErr.message?.startsWith('TIMEOUT_');
-        if ((isNetworkErr || isTimeout) && attempt < 4 && !controller.signal.aborted) {
-          const delay = attempt * 2000; // 2s, 4s, 6s
-          dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'downloading', error: `محاولة ${attempt}/3... (${fetchErr.message})` } });
-          dispatch({ type: 'LOG', payload: { id: file.id, message: `↺ retry ${attempt}/3 after ${delay/1000}s — ${fetchErr.message}` } });
-          await sleep(delay);
-          return fetchWithConfirm(fileId, apiKey, rangeStart, attempt + 1);
-        }
-        // After 3 retries the SAME network error persists → this is structural, not transient.
-        // Almost always: CORS block (no proxy configured) or API key restricted to wrong referrers.
-        if (isNetworkErr && attempt >= 4 && !settings.proxyUrl) {
-          throw new Error('CORS_LIKELY');
+        if (controller.signal.aborted) throw fetchErr;
+
+        if (isNetworkErr || isTimeout) {
+          // First retry the SAME url once (handles transient blips)
+          if (attemptAtThisUrl < 2) {
+            dispatch({ type: 'LOG', payload: { id: file.id, message: `↺ retry on same source — ${fetchErr.message}` } });
+            await sleep(1500);
+            return fetchWithConfirm(fileId, apiKey, rangeStart, urlIndex, attemptAtThisUrl + 1);
+          }
+          // Then move to the NEXT candidate URL (different proxy / direct)
+          if (urlIndex + 1 < candidates.length) {
+            dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'downloading', error: `جرّب مصدر بديل ${urlIndex + 2}/${candidates.length}...` } });
+            dispatch({ type: 'LOG', payload: { id: file.id, message: `↺ switching source ${urlIndex + 2}/${candidates.length} after: ${fetchErr.message}` } });
+            await sleep(800);
+            return fetchWithConfirm(fileId, apiKey, rangeStart, urlIndex + 1, 1);
+          }
+          // Exhausted every candidate — this is structural (CORS / key restriction / no internet)
+          throw new Error('ALL_SOURCES_FAILED');
         }
         throw fetchErr;
       }
@@ -1521,9 +1546,9 @@ const HomePage = ({ onNavigate }) => {
       if (err.message === 'HTML_WARNING_PAGE') {
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: t('htmlBlocked') } });
         if (!isZip) setTimeout(() => window.open(`https://drive.google.com/uc?export=download&confirm=t&id=${file.id}`, '_blank', 'noopener'), 600);
-      } else if (err.message === 'CORS_LIKELY') {
-        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ الطلبات تُحظر باستمرار — غالباً CORS أو قيود مفتاح API. فعّل CORS proxy في الإعدادات.' } });
-        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: CORS_LIKELY — same network error after 3 retries, no proxy configured` } });
+      } else if (err.message === 'ALL_SOURCES_FAILED') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ فشل كل المصادر (مباشر + 2 بروكسي). تأكد من الإنترنت أو من صلاحية مفتاح API.' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: ALL_SOURCES_FAILED — direct + all proxies failed` } });
       } else if (err.message?.startsWith('TIMEOUT_') || err.message?.startsWith('STALL')) {
         const label = err.message.includes('STALL') ? 'توقف التحميل (stall)' : 'انتهت مدة الاتصال (timeout)';
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: label } });
