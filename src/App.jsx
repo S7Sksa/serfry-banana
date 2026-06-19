@@ -518,6 +518,18 @@ const safeSetLS = (key, value) => {
   try { localStorage.setItem(key, JSON.stringify(value)); return true; }
   catch (e) { console.warn(`Failed to persist "${key}":`, e); return false; }
 };
+
+// Raw (non-JSON) safe accessors — for storage that may be fully blocked
+// (Brave Shields, Safari Private Mode, some in-app browsers throw on ANY access)
+const safeLSGetRaw = (key) => {
+  try { return localStorage.getItem(key); } catch { return null; }
+};
+const safeLSSetRaw = (key, value) => {
+  try { localStorage.setItem(key, value); return true; } catch { return false; }
+};
+const safeLSRemove = (key) => {
+  try { localStorage.removeItem(key); } catch {}
+};
  
 // ==========================================
 // 5. CONTEXTS & PROVIDERS
@@ -573,7 +585,7 @@ const SettingsProvider = ({ children }) => {
   // Decrypt API key on mount
   useEffect(() => {
     (async () => {
-      const enc = localStorage.getItem('sb_apikey_enc');
+      const enc = safeLSGetRaw('sb_apikey_enc');
       if (enc) {
         const dec = await decryptApiKey(enc);
         if (dec) setSettings(prev => ({ ...prev, apiKey: dec }));
@@ -605,9 +617,9 @@ const SettingsProvider = ({ children }) => {
       try {
         if (value) {
           const enc = await encryptApiKey(value);
-          localStorage.setItem('sb_apikey_enc', enc);
+          safeLSSetRaw('sb_apikey_enc', enc);
         } else {
-          localStorage.removeItem('sb_apikey_enc');
+          safeLSRemove('sb_apikey_enc');
         }
       } catch (e) { console.warn('Encryption failed, storing plain', e); }
     }
@@ -615,7 +627,7 @@ const SettingsProvider = ({ children }) => {
   };
  
   const resetSettings = () => {
-    localStorage.removeItem('sb_apikey_enc');
+    safeLSRemove('sb_apikey_enc');
     setSettings(defaultSettings);
   };
  
@@ -1242,19 +1254,42 @@ const HomePage = ({ onNavigate }) => {
   // ── Download engine (with pause/resume) ───────────────────
   // ── StreamSaver loader (loaded once, cached) ───────────────────
   const streamSaverRef = useRef(null);
+  const streamSaverFailedRef = useRef(false);
   const getStreamSaver = useCallback(async () => {
     if (streamSaverRef.current) return streamSaverRef.current;
-    return new Promise((resolve, reject) => {
+    // Don't retry a script tag that's already failed/hanging
+    if (streamSaverFailedRef.current) throw new Error('StreamSaver previously failed');
+
+    const loadPromise = new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-streamsaver]');
+      if (existing) { existing.remove(); } // clear any stuck previous attempt
+
       const script = document.createElement('script');
       script.src = 'https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js';
+      script.dataset.streamsaver = 'true';
       script.onload = () => {
-        window.streamSaver.mitm = 'https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/mitm.html';
-        streamSaverRef.current = window.streamSaver;
-        resolve(window.streamSaver);
+        try {
+          window.streamSaver.mitm = 'https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/mitm.html';
+          streamSaverRef.current = window.streamSaver;
+          resolve(window.streamSaver);
+        } catch (e) { reject(e); }
       };
       script.onerror = () => reject(new Error('StreamSaver failed to load'));
       document.head.appendChild(script);
     });
+
+    // Hard timeout so a blocked/hanging script (CSP, ad-blocker, slow CDN) never
+    // freezes the download at 0% forever.
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('StreamSaver load timeout')), 8000)
+    );
+
+    try {
+      return await Promise.race([loadPromise, timeoutPromise]);
+    } catch (e) {
+      streamSaverFailedRef.current = true; // don't keep retrying a dead CDN/script every file
+      throw e;
+    }
   }, []);
 
   const downloadFile = useCallback(async (file, finalName, batchId, isZip = false, resumeFrom = null) => {
@@ -1279,22 +1314,53 @@ const HomePage = ({ onNavigate }) => {
     };
 
     // ── Fetch with automatic confirm-token retry ──────────────
-    const fetchWithConfirm = async (fileId, apiKey, rangeStart = 0) => {
+    // ── Race a promise against a timeout ──────────────────────
+    const withTimeout = (promise, ms, label) => {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TIMEOUT_${label}`)), ms);
+      });
+      return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    };
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const fetchWithConfirm = async (fileId, apiKey, rangeStart = 0, attempt = 1) => {
       const headers = {};
       if (rangeStart > 0) headers['Range'] = `bytes=${rangeStart}-`;
 
       let url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`;
       if (settings.proxyUrl) url = `${settings.proxyUrl}${encodeURIComponent(url)}`;
 
-      let response = await fetch(url, { signal: controller.signal, headers });
+      // Auto-retry network errors (Failed to fetch / TypeError) up to 3 times
+      let response;
+      try {
+        response = await withTimeout(
+          fetch(url, { signal: controller.signal, headers }),
+          20_000, 'CONNECT'
+        );
+      } catch (fetchErr) {
+        const isNetworkErr = fetchErr instanceof TypeError || fetchErr.message === 'Failed to fetch' || fetchErr.message?.includes('network');
+        const isTimeout = fetchErr.message?.startsWith('TIMEOUT_');
+        if ((isNetworkErr || isTimeout) && attempt < 4 && !controller.signal.aborted) {
+          const delay = attempt * 2000; // 2s, 4s, 6s
+          dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'downloading', error: `محاولة ${attempt}/3... (${fetchErr.message})` } });
+          dispatch({ type: 'LOG', payload: { id: file.id, message: `↺ retry ${attempt}/3 after ${delay/1000}s — ${fetchErr.message}` } });
+          await sleep(delay);
+          return fetchWithConfirm(fileId, apiKey, rangeStart, attempt + 1);
+        }
+        throw fetchErr;
+      }
       const contentType = response.headers.get('content-type') || '';
 
       // Google returns HTML warning page for large unscanned files
       if (contentType.includes('text/html') || response.status === 403) {
         // Try the export/download endpoint which forces download
         const exportUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`;
-        const exportHeaders = { ...headers };
-        response = await fetch(exportUrl, { signal: controller.signal, headers: exportHeaders });
+        response = await withTimeout(
+          fetch(exportUrl, { signal: controller.signal, headers }),
+          20_000, 'EXPORT'
+        );
 
         const ct2 = response.headers.get('content-type') || '';
         if (ct2.includes('text/html')) {
@@ -1303,7 +1369,12 @@ const HomePage = ({ onNavigate }) => {
           const token = extractConfirmToken(html);
           if (token) {
             const confirmedUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=${token}`;
-            response = await fetch(confirmedUrl, { signal: controller.signal, headers });
+            response = await withTimeout(
+              fetch(confirmedUrl, { signal: controller.signal, headers }),
+              20_000, 'CONFIRM'
+            );
+            const ct3 = response.headers.get('content-type') || '';
+            if (ct3.includes('text/html')) throw new Error('HTML_WARNING_PAGE');
           } else {
             throw new Error('HTML_WARNING_PAGE');
           }
@@ -1311,9 +1382,13 @@ const HomePage = ({ onNavigate }) => {
       }
 
       if (!response.ok && response.status !== 206) throw new Error(`HTTP_${response.status}`);
+
+      // Sanity check: content-length=0 means something went wrong
+      const cl = response.headers.get('content-length');
+      if (cl !== null && parseInt(cl, 10) === 0) throw new Error('EMPTY_RESPONSE');
+
       return response;
     };
-
 
     try {
       const response = await fetchWithConfirm(file.id, settings.apiKey, resumeFrom?.loaded || 0);
@@ -1321,6 +1396,7 @@ const HomePage = ({ onNavigate }) => {
       const reader = response.body.getReader();
       let loaded = resumeFrom?.loaded || 0;
       let lastDispatch = 0;
+      let lastChunkTime = Date.now(); // for stall detection
 
       if (useStream) {
         // ── STREAM MODE: pipe directly to disk via StreamSaver ──────
@@ -1332,12 +1408,15 @@ const HomePage = ({ onNavigate }) => {
           const fileStream = ss.createWriteStream(finalName, { size: total || undefined });
           fileStreamWriter = fileStream.getWriter();
 
+          const STALL_LIMIT = 30_000; // 30s without data = stall
           while (true) {
             if (controller.signal.aborted) break;
-            const { done, value } = await reader.read();
+            const chunk = await withTimeout(reader.read(), STALL_LIMIT, 'STALL');
+            const { done, value } = chunk;
             if (done) break;
             await fileStreamWriter.write(value);
             loaded += value.length;
+            lastChunkTime = Date.now();
             const now = Date.now();
             if (now - lastDispatch > 300) {
               lastDispatch = now;
@@ -1370,11 +1449,13 @@ const HomePage = ({ onNavigate }) => {
       // We use a chunked approach and revoke the URL after 2 min to free memory.
       const chunks = resumeFrom?.chunks ? [...resumeFrom.chunks] : [];
 
+      const STALL_LIMIT = 30_000; // 30s without data = stall
       while (true) {
         if (controller.signal.aborted) break;
-        const { done, value } = await reader.read();
+        const { done, value } = await withTimeout(reader.read(), STALL_LIMIT, 'STALL');
         if (done) break;
         chunks.push(value); loaded += value.length;
+        lastChunkTime = Date.now();
         const now = Date.now();
         if (now - lastDispatch > 200 || loaded === total) {
           lastDispatch = now;
@@ -1414,11 +1495,22 @@ const HomePage = ({ onNavigate }) => {
         return null;
       }
       if (err.message === 'HTML_WARNING_PAGE') {
-        // Couldn't bypass warning — open in browser as last resort
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: t('htmlBlocked') } });
         if (!isZip) setTimeout(() => window.open(`https://drive.google.com/uc?export=download&confirm=t&id=${file.id}`, '_blank', 'noopener'), 600);
+      } else if (err.message?.startsWith('TIMEOUT_') || err.message?.startsWith('STALL')) {
+        const label = err.message.includes('STALL') ? 'توقف التحميل (stall)' : 'انتهت مدة الاتصال (timeout)';
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: label } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: ${label} — ${formatBytes(loaded)} تم استلامها` } });
+      } else if (err.message === 'EMPTY_RESPONSE') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: 'استجابة فارغة من Google Drive' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: EMPTY_RESPONSE` } });
       } else {
-        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: err.message || t('downloadFailed') } });
+        // Friendly message for "Failed to fetch" (network/CORS)
+        const isNetErr = err instanceof TypeError || err.message === 'Failed to fetch' || err.message?.includes('network');
+        const userMsg = isNetErr
+          ? 'خطأ شبكة — تأكد من اتصال الإنترنت أو فعّل CORS proxy في الإعدادات'
+          : (err.message || t('downloadFailed'));
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: userMsg } });
         dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: ${err.message}` } });
       }
       dispatch({ type: 'COMPLETE_DOWNLOAD', payload: { name: finalName, size: 0, status: 'failed', kind: isZip ? 'zip-part' : 'file' } });
@@ -1965,7 +2057,7 @@ const SettingsPage = () => {
   const { addToast } = useContext(ToastContext);
   const [notifPermission, setNotifPermission] = useState(() => (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'));
   const [apiKeyInput, setApiKeyInput] = useState('');
-  const [apiKeySet, setApiKeySet] = useState(() => !!localStorage.getItem('sb_apikey_enc'));
+  const [apiKeySet, setApiKeySet] = useState(() => !!safeLSGetRaw('sb_apikey_enc'));
   const [showKey, setShowKey] = useState(false);
  
   const requestNotifPermission = async () => {
@@ -2131,18 +2223,39 @@ const SettingsPage = () => {
 // 14. ERROR BOUNDARY
 // ==========================================
 class ErrorBoundary extends React.Component {
-  constructor(props) { super(props); this.state = { hasError: false }; }
-  static getDerivedStateFromError() { return { hasError: true }; }
+  constructor(props) { super(props); this.state = { hasError: false, errorMsg: '' }; }
+  static getDerivedStateFromError(error) { return { hasError: true, errorMsg: error?.message || String(error) }; }
   componentDidCatch(error, errorInfo) { console.error('ErrorBoundary caught:', error, errorInfo); }
+
+  handleClearAndReload = () => {
+    // Clear all our keys (storage may be partially blocked — guard every call)
+    const keys = ['sb_settings', 'sb_apikey_enc', 'sb_queue', 'sb_favorites', 'sb_lastepisode', 'sb_lang'];
+    keys.forEach(k => { try { localStorage.removeItem(k); } catch {} });
+    try { window.location.reload(); } catch {}
+  };
+
   render() {
     if (this.state.hasError) {
+      const isStorageError = /storage|quota|localstorage|securityerror/i.test(this.state.errorMsg || '');
       return (
-        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px', background: 'var(--bg)', color: 'var(--text)' }}>
-          <div style={{ textAlign: 'center', maxWidth: '360px' }}>
+        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px', background: '#0C0B09', color: '#EDE9E1', fontFamily: 'sans-serif' }}>
+          <div style={{ textAlign: 'center', maxWidth: '380px' }}>
             <div style={{ fontSize: '2.5rem', marginBottom: '12px' }}>🍌</div>
-            <h3 style={{ marginBottom: '8px', fontWeight: 700 }}>Something went wrong</h3>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '16px' }}>Try reloading the page. If the problem continues, clear this site's storage from your browser settings.</p>
-            <button onClick={() => window.location.reload()} className="btn-primary">Reload</button>
+            <h3 style={{ marginBottom: '8px', fontWeight: 700 }}>حدث خطأ غير متوقع</h3>
+            <p style={{ color: '#9B9589', fontSize: '0.9rem', marginBottom: '8px' }}>
+              {isStorageError
+                ? 'يبدو أن متصفحك يحظر التخزين المحلي (مثل وضع التصفح الخاص أو إعدادات الخصوصية القوية في Brave/Safari).'
+                : 'جرب إعادة تحميل الصفحة. لو استمرت المشكلة، امسح بيانات الموقع المحفوظة.'}
+            </p>
+            {this.state.errorMsg && (
+              <p style={{ color: '#5C5850', fontSize: '0.72rem', marginBottom: '16px', fontFamily: 'monospace', wordBreak: 'break-word', background: 'rgba(255,255,255,0.04)', padding: '8px 10px', borderRadius: '8px' }}>
+                {this.state.errorMsg}
+              </p>
+            )}
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
+              <button onClick={() => window.location.reload()} style={{ background: 'transparent', border: '1px solid rgba(255,255,255,0.15)', color: '#EDE9E1', padding: '10px 18px', borderRadius: '10px', cursor: 'pointer', fontSize: '0.85rem' }}>إعادة تحميل</button>
+              <button onClick={this.handleClearAndReload} style={{ background: '#FFC700', border: 'none', color: '#1A1500', fontWeight: 700, padding: '10px 18px', borderRadius: '10px', cursor: 'pointer', fontSize: '0.85rem' }}>مسح البيانات وإعادة التحميل</button>
+            </div>
           </div>
         </div>
       );
