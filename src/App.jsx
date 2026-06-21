@@ -1344,6 +1344,37 @@ const HomePage = ({ onNavigate }) => {
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+    // ── Quick API-key / file sanity check (metadata call, no body) ──
+    // Runs once per download attempt before burning through 5 source ×
+    // 2 retries. If the key/file is structurally broken, this surfaces
+    // a clear reason in ~3-5s instead of the user watching "switching
+    // source" loop for 30+ seconds at 3%.
+    const precheckApiAccess = async (fileId, apiKey) => {
+      if (!apiKey) throw new Error('NO_API_KEY');
+      const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,size&key=${apiKey}`;
+      let res;
+      try {
+        res = await withTimeout(fetch(metaUrl, { signal: controller.signal }), 6_000, 'PRECHECK');
+      } catch (e) {
+        // Network/CORS failure on the precheck itself is not conclusive
+        // (could be a local proxy/extension issue) — let the normal
+        // candidate loop decide; don't block the download on this.
+        return;
+      }
+      if (res.status === 400 || res.status === 403) {
+        let reason = 'API_KEY_INVALID';
+        try {
+          const body = await res.json();
+          const msg = body?.error?.message || '';
+          if (/api key not valid/i.test(msg)) reason = 'API_KEY_INVALID';
+          else if (/disabled/i.test(msg)) reason = 'API_NOT_ENABLED';
+          else if (/permission/i.test(msg)) reason = 'FILE_NOT_PUBLIC';
+        } catch {}
+        throw new Error(reason);
+      }
+      if (res.status === 404) throw new Error('FILE_NOT_FOUND');
+    };
+
     // List of candidate URLs to try in order: direct first (works if API key
     // allows it), then each known CORS proxy. We cycle through all of them
     // before giving up, instead of retrying the SAME broken URL repeatedly.
@@ -1355,7 +1386,10 @@ const HomePage = ({ onNavigate }) => {
         candidates.push(`${settings.proxyUrl}${encodeURIComponent(base)}`);
       }
       candidates.push(base); // direct (works for many API keys / browsers)
+      // corsproxy.io and allorigins.win are free/shared and frequently rate-limited
+      // or fully down — keep them as last-resort, and add a more reliable third option.
       candidates.push(`https://corsproxy.io/?url=${encodeURIComponent(base)}`);
+      candidates.push(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(base)}`);
       candidates.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(base)}`);
       // De-dupe in case user's proxy matches one of the defaults
       return [...new Set(candidates)];
@@ -1374,7 +1408,7 @@ const HomePage = ({ onNavigate }) => {
       try {
         response = await withTimeout(
           fetch(url, { signal: controller.signal, headers }),
-          15_000, 'CONNECT'
+          8_000, 'CONNECT'
         );
       } catch (fetchErr) {
         const isNetworkErr = fetchErr instanceof TypeError || fetchErr.message === 'Failed to fetch' || fetchErr.message?.includes('network');
@@ -1385,7 +1419,7 @@ const HomePage = ({ onNavigate }) => {
           // First retry the SAME url once (handles transient blips)
           if (attemptAtThisUrl < 2) {
             dispatch({ type: 'LOG', payload: { id: file.id, message: `↺ retry on same source — ${fetchErr.message}` } });
-            await sleep(1500);
+            await sleep(700);
             return fetchWithConfirm(fileId, apiKey, rangeStart, urlIndex, attemptAtThisUrl + 1);
           }
           // Then move to the NEXT candidate URL (different proxy / direct)
@@ -1440,6 +1474,11 @@ const HomePage = ({ onNavigate }) => {
     };
 
     try {
+      try { await precheckApiAccess(file.id, settings.apiKey); } catch (preErr) {
+        if (['API_KEY_INVALID', 'API_NOT_ENABLED', 'FILE_NOT_PUBLIC', 'FILE_NOT_FOUND', 'NO_API_KEY'].includes(preErr.message)) {
+          throw preErr; // skip straight to the friendly handler below — no point trying 5 sources
+        }
+      }
       const response = await fetchWithConfirm(file.id, settings.apiKey, resumeFrom?.loaded || 0);
       const total = parseInt(response.headers.get('content-length') || file.size || 0, 10);
       const reader = response.body.getReader();
@@ -1546,6 +1585,21 @@ const HomePage = ({ onNavigate }) => {
       if (err.message === 'HTML_WARNING_PAGE') {
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: t('htmlBlocked') } });
         if (!isZip) setTimeout(() => window.open(`https://drive.google.com/uc?export=download&confirm=t&id=${file.id}`, '_blank', 'noopener'), 600);
+      } else if (err.message === 'NO_API_KEY') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ لا يوجد مفتاح Google API. أضفه من الإعدادات.' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: NO_API_KEY` } });
+      } else if (err.message === 'API_KEY_INVALID') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ مفتاح Google API غير صالح أو منتهي. تأكد منه في الإعدادات.' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: API_KEY_INVALID` } });
+      } else if (err.message === 'API_NOT_ENABLED') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ Google Drive API غير مفعّلة على هذا المفتاح في Google Cloud Console.' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: API_NOT_ENABLED` } });
+      } else if (err.message === 'FILE_NOT_PUBLIC') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ الملف غير مشارك للعامة على Google Drive ("Anyone with the link").' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: FILE_NOT_PUBLIC` } });
+      } else if (err.message === 'FILE_NOT_FOUND') {
+        dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ الملف غير موجود (حُذف أو المعرّف خاطئ).' } });
+        dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: FILE_NOT_FOUND` } });
       } else if (err.message === 'ALL_SOURCES_FAILED') {
         dispatch({ type: 'UPDATE', payload: { id: file.id, batchId, status: 'failed', error: '⚠️ فشل كل المصادر (مباشر + 2 بروكسي). تأكد من الإنترنت أو من صلاحية مفتاح API.' } });
         dispatch({ type: 'LOG', payload: { id: file.id, message: `✕ ${finalName}: ALL_SOURCES_FAILED — direct + all proxies failed` } });
